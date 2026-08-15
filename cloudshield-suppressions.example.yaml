@@ -1,0 +1,31 @@
+# Accepted-risk suppressions for CloudShield.
+#
+# Copy to cloudshield-suppressions.yaml (picked up automatically) or pass an
+# explicit path with --suppressions.
+#
+# A suppressed check is still scanned and still appears in the report, marked
+# SUPPRESSED. It stops penalising the risk score and stops failing --fail-on.
+#
+# Every entry needs a reason and an expiry date. An accepted risk with no end
+# date is just an ignored one, and expired entries are reported as warnings
+# rather than silently honoured.
+
+suppressions:
+  # check_id supports glob patterns.
+  - check_id: EC2-NO-PUBLIC-IP
+    resource_id: i-0123456789abcdef0
+    region: us-east-1
+    reason: Public bastion host; SSH restricted to the corporate VPN CIDR.
+    expires: 2026-12-31
+
+  # Omit resource_id / region to cover all of them.
+  - check_id: IAM-ROLE-WILDCARD
+    resource_id: arn:aws:iam::123456789012:role/BreakGlassAdmin
+    reason: Break-glass role, protected by SCP and reviewed quarterly.
+    expires: 2026-09-30
+
+  # Glob across a family of checks.
+  - check_id: S3-BUCKET-*
+    resource_id: public-website-assets
+    reason: Intentional public static site bucket, no sensitive objects.
+    expires: 2027-01-31

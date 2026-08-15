@@ -1,137 +1,181 @@
-"""Run optional automated remediations from CloudShield JSON results."""
+"""Run remediations from a CloudShield JSON results file.
+
+Two deliberate differences from the original implementation:
+
+* Actions are boto3 calls, not shell commands. The results file is untrusted
+  input -- interpolating resource names from it into a ``shell=True`` command
+  string was arbitrary code execution for anyone who could write that file.
+* The session comes from ``core.auth``, the same place ``main.py`` gets it, so
+  ``--fix`` acts on the account that was scanned rather than on whatever
+  credentials the AWS CLI happens to pick up.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence
+
+from botocore.exceptions import BotoCoreError, ClientError
+from dotenv import load_dotenv
+
+from core.auth import AWSAuthManager
+from core.models import CheckResult
+from remediators import registry
+
+EXIT_OK = 0
+EXIT_FAILED_ACTIONS = 1
+EXIT_ERROR = 2
 
 
-def load_results(path: Path) -> Dict:
+def load_checks(path: Path) -> List[CheckResult]:
     with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        payload = json.load(handle)
 
+    raw_checks = payload.get("checks")
+    if not isinstance(raw_checks, list):
+        raise ValueError("Invalid results format: 'checks' must be a list.")
 
-def remediation_for_check(check: Dict) -> Tuple[str, str]:
-    check_id = str(check.get("check_id", ""))
-    details = check.get("details", {}) or {}
-    resource_id = str(check.get("resource_id", ""))
-
-    if check_id == "EC2-EBS-ENCRYPTION-BY-DEFAULT":
-        return (
-            "aws ec2 enable-ebs-encryption-by-default",
-            "Enable account-level EBS encryption by default.",
-        )
-
-    if check_id == "EC2-IMDSV2-REQUIRED":
-        instance_id = resource_id
-        if instance_id:
-            return (
-                f"aws ec2 modify-instance-metadata-options --instance-id {instance_id} --http-tokens required",
-                "Require IMDSv2 on the affected instance.",
-            )
-
-    if check_id == "S3-ACCOUNT-PUBLIC-ACCESS-BLOCK":
-        account_id = resource_id.replace("account:", "")
-        if account_id:
-            return (
-                "aws s3control put-public-access-block "
-                f"--account-id {account_id} "
-                "--public-access-block-configuration "
-                "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true",
-                "Enable all account-level S3 public access block controls.",
-            )
-
-    if check_id == "S3-PUBLIC-ACCESS-BLOCK":
-        bucket = details.get("bucket") or resource_id
-        if bucket:
-            return (
-                "aws s3api put-public-access-block "
-                f"--bucket {bucket} "
-                "--public-access-block-configuration "
-                "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true",
-                "Enable all bucket-level S3 public access block controls.",
-            )
-
-    if check_id == "IAM-USER-KEY-AGE":
-        user_name = details.get("user")
-        access_key_id = details.get("access_key_id")
-        if user_name and access_key_id:
-            return (
-                f"aws iam update-access-key --user-name {user_name} --access-key-id {access_key_id} --status Inactive",
-                "Disable stale IAM access key before rotation.",
-            )
-
-    return ("", "No automated command mapped for this failed check.")
-
-
-def collect_actions(checks: List[Dict]) -> List[Tuple[Dict, str, str]]:
-    actions: List[Tuple[Dict, str, str]] = []
-    for check in checks:
-        if str(check.get("status", "")).upper() != "FAIL":
+    checks: List[CheckResult] = []
+    for entry in raw_checks:
+        if not isinstance(entry, dict):
             continue
-        command, description = remediation_for_check(check)
-        if command:
-            actions.append((check, command, description))
-    return actions
+        checks.append(
+            CheckResult(
+                service=str(entry.get("service", "unknown")),
+                resource_id=str(entry.get("resource_id", "")),
+                resource_type=str(entry.get("resource_type", "unknown")),
+                check_id=str(entry.get("check_id", "")),
+                check_name=str(entry.get("check_name", "")),
+                status=str(entry.get("status", "")).upper(),
+                severity=str(entry.get("severity", "Low")),
+                cis_control=str(entry.get("cis_control", "N/A")),
+                message=str(entry.get("message", "")),
+                details=entry.get("details") or {},
+                region=str(entry.get("region", "global")),
+                suppressed=bool(entry.get("suppressed", False)),
+                suppression_reason=str(entry.get("suppression_reason", "")),
+            )
+        )
+    return checks
 
 
-def run_actions(actions: List[Tuple[Dict, str, str]], execute: bool) -> None:
-    if not actions:
-        print("No auto-remediation actions available for current failed checks.")
+def print_plan(results: Sequence[registry.RemediationResult]) -> None:
+    if not results:
+        print("No automated remediations are available for the failed checks in this file.")
         return
 
-    for check, command, description in actions:
+    for result in results:
+        marker = " [DESTRUCTIVE]" if result.destructive else ""
         print("-")
-        print(f"Check: {check.get('check_id', 'unknown')} | Resource: {check.get('resource_id', 'unknown')}")
-        print(f"Action: {description}")
-        print(f"Command: {command}")
-        if not execute:
-            continue
-
-        try:
-            result = subprocess.run(command, shell=True, check=False, text=True, capture_output=True)
-        except OSError as exc:
-            print(f"Execution failed: {exc}")
-            continue
-
-        print(f"Exit code: {result.returncode}")
-        if result.stdout.strip():
-            print(result.stdout.strip())
-        if result.stderr.strip():
-            print(result.stderr.strip())
+        print(f"Check:    {result.check_id}{marker}")
+        print(f"Resource: {result.resource_id} ({result.region})")
+        print(f"Status:   {result.status}")
+        print(f"Action:   {result.message}")
+        if result.command:
+            print(f"CLI equivalent: {result.command}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="CloudShield remediation runner")
+def summarise(results: Sequence[registry.RemediationResult]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+    return counts
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cloudshield-remediate",
+        description="Plan or apply remediations from a CloudShield results file.",
+    )
     parser.add_argument(
         "--results",
         default="cloudshield_results.json",
-        help="Path to JSON results generated by main.py",
+        help="Path to JSON results generated by main.py.",
     )
     parser.add_argument(
         "--fix",
         action="store_true",
-        help="Execute remediation commands. Without this flag, commands are only listed.",
+        help="Apply the allowed remediations. Without this, actions are only listed.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--allow",
+        nargs="+",
+        default=[],
+        metavar="CHECK_ID",
+        help="Check ids --fix is permitted to act on, or 'all'. Required for --fix.",
+    )
+    parser.add_argument(
+        "--list-checks",
+        action="store_true",
+        help="List every check id with an automated remediation, then exit.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    load_dotenv()
+    args = build_parser().parse_args(argv)
+
+    if args.list_checks:
+        print("Check ids with an automated remediation:\n")
+        for check_id, remediation in sorted(registry.REMEDIATIONS.items()):
+            if not remediation.automated:
+                continue
+            flag = " [destructive]" if remediation.destructive else ""
+            print(f"  {check_id}{flag}\n      {remediation.description}")
+        return EXIT_OK
 
     results_path = Path(args.results)
     if not results_path.exists():
-        raise FileNotFoundError(
-            f"Results file not found: {results_path}. Run main.py first to generate cloudshield_results.json."
+        print(
+            f"Results file not found: {results_path}. Run main.py first to generate it.",
+            file=sys.stderr,
         )
+        return EXIT_ERROR
 
-    results = load_results(results_path)
-    checks = results.get("checks", [])
-    if not isinstance(checks, list):
-        raise ValueError("Invalid results format: 'checks' must be a list.")
+    try:
+        checks = load_checks(results_path)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"Could not read {results_path}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
 
-    actions = collect_actions(checks)
-    run_actions(actions, execute=args.fix)
+    if args.fix and not args.allow:
+        print(
+            "--fix requires --allow with one or more check ids (or 'all').\n"
+            "Run with --list-checks to see what can be automated.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    session = None
+    if args.fix:
+        try:
+            session = AWSAuthManager().get_session()
+        except (RuntimeError, BotoCoreError, ClientError) as exc:
+            print(f"AWS authentication failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+
+        identity = "unknown account"
+        try:
+            identity = session.client("sts").get_caller_identity().get("Account", "unknown")
+        except (BotoCoreError, ClientError):
+            pass
+        print(f"Applying remediations to account {identity}.\n")
+
+    results = registry.run(
+        session, checks, allow=args.allow, apply_changes=args.fix  # type: ignore[arg-type]
+    )
+    print_plan(results)
+
+    counts = summarise(results)
+    if counts:
+        print("\n" + " | ".join(f"{status}: {count}" for status, count in sorted(counts.items())))
+
+    return EXIT_FAILED_ACTIONS if counts.get(registry.STATUS_FAILED) else EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

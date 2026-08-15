@@ -1,0 +1,32 @@
+# Docs and notes that are not the README
+*.md
+!README.md
+
+# Tests and dev tooling
+tests/
+pytest.ini
+conftest.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Scan output -- contains real account IDs, ARNs, bucket and user names.
+cloudshield_report.pdf
+cloudshield_results.json
+cloudshield_results.*.json
+*.sarif
